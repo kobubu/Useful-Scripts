@@ -1,12 +1,12 @@
-// FilePath: Main.mjs
 import { DataSync } from './DataSync.mjs'; 
-import { spreadsheetId, vendorsDataSheetName } from './Const.mjs'; 
+import { translatorsDataSheetName, editorsDataSheetName } from './Const.mjs'; 
 import readline from 'readline';
 
 async function main() {
   try {
-    const dataSync = new DataSync(spreadsheetId, vendorsDataSheetName);
-    await dataSync.exportDataToDashboard();
+    const dataSync = new DataSync();
+    await dataSync.exportDataToDashboard(translatorsDataSheetName, 'translators');
+    await dataSync.exportDataToDashboard(editorsDataSheetName, 'editors');
   } catch (error) {
     console.error('Произошла ошибка:', error);
   }

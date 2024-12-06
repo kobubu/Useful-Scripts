@@ -3,84 +3,106 @@ import pandas as pd
 import re
 
 
-def parse_pdf_to_tree(doc_path, output_excel):
-    # Открываем PDF
-    doc = fitz.open(doc_path)
+class Term:
+    def __init__(self, source: str, target: str):
+        """
+        Инициализация объекта Term.
 
-    # Инициализация переменных
-    text_data = []
-    for page_num in range(8, 394):  # C 9-й по 394-ю страницы
-        page = doc.load_page(page_num)
-        text = page.get_text("text")
-        # Убираем заголовки и футеры
-        lines = text.split('\n')
-        if len(lines) > 3:
-            lines = lines[2:-1]
-        text = '\n'.join(lines)
-        text_data.append(text)
+        :param source: Исходное слово или фраза.
+        :param target: Целевое слово или фраза.
+        """
+        self.source = source
+        self.target = target
 
-    # Объединяем все страницы в один текст
-    full_text = '\n'.join(text_data)
+    def __str__(self):
+        """
+        Возвращает строковое представление объекта Term.
 
-    # Разбиение на строки
-    lines = full_text.splitlines()
+        :return: Строка, представляющая объект Term.
+        """
+        return f"Term(source='{self.source}', target='{self.target}')"
 
-    # Структура данных для дерева
-    tree = []
-    stack = [tree]  # Стек для отслеживания текущего уровня в дереве
-    current_root = None
+    def __repr__(self):
+        """
+        Возвращает "официальное" строковое представление объекта Term.
+
+        :return: Строка, представляющая объект Term.
+        """
+        return self.__str__()
+
+
+def parse_text(text: str) -> list:
+    """
+    Парсит текст и создает экземпляры класса Term.
+
+    :param text: Текст для парсинга.
+    :return: Список экземпляров класса Term.
+    """
+    terms = []
+    lines = text.split('\n')
 
     for line in lines:
-        line = line.lstrip()
+        line = line.strip()
+        if not line:
+            continue
 
-        # Определяем уровень вложенности на основе количества символов "~"
-        level = 0
-        while line.startswith('~'):
-            level += 1
-            line = line[1:].lstrip()
-
-        # Используем регулярное выражение для разделения на RU и EN
-        match = re.match(r"^(.*?)\s{2,}([a-zA-Z\s\-\(\)\d]+)$", line)
+        # Ищем русские и английские слова
+        match = re.match(r'([А-я~\s_-]*)([A-z_\s-]*)', line)
         if match:
-            ru = match.group(1).strip()
-            en = match.group(2).strip()
+            source = match.group(1).strip()
+            target = match.group(2).strip()
+            terms.append(Term(source, target))
         else:
-            ru = line.strip()
-            en = ''
+            # Если не нашли разделение, пытаемся разделить по другим символам
+            parts = re.split(r'\s+', line)
+            if len(parts) > 1:
+                ru_parts = []
+                en_parts = []
+                for part in parts:
+                    if re.match(r'[А-я~\s_-]*', part):
+                        ru_parts.append(part)
+                    elif re.match(r'[A-z_\s-]*', part):
+                        en_parts.append(part)
+                if ru_parts and en_parts:
+                    source = ' '.join(ru_parts).strip()
+                    target = ' '.join(en_parts).strip()
+                    terms.append(Term(source, target))
 
-        # Обработка структуры вложенности
-        while len(stack) > level + 1:
-            stack.pop()
-
-        # Добавляем текущий термин в структуру
-        node = {'RU': ru, 'EN': en, 'children': []}
-        stack[-1].append(node)
-
-        # Добавляем список детей для текущего узла в стек
-        stack.append(node['children'])
-
-    # Плоское представление дерева для записи в Excel
-    def flatten_tree(nodes, parent_ru=None):
-        for node in nodes:
-            yield {'RU': node['RU'], 'EN': node['EN'], 'Parent RU': parent_ru}
-            yield from flatten_tree(node['children'], parent_ru=node['RU'])
-
-    # Собираем все записи
-    records = list(flatten_tree(tree))
-
-    # Создаем DataFrame
-    df = pd.DataFrame(records)
-
-    # Сохраняем результат в Excel
-    df.to_excel(output_excel, index=False)
-    print(f"Результат сохранен в {output_excel}")
+    return terms
 
 
-# Использование
+def parse_pdf_to_text(doc_path):
+    # Open the PDF document
+    doc = fitz.open(doc_path)
+
+    # Extract text from pages 9 to 394 (0-based: pages 8 to 393)
+    text_data = []
+    for page_num in range(8, 394):
+        page = doc.load_page(page_num)
+        text = page.get_text("text")
+        text_data.append(text)
+
+    # Объединяем текст из всех страниц
+    full_text = '\n'.join(text_data)
+    return full_text
+
+
 if __name__ == "__main__":
     dir = "C:\\Users\\Igor\\Desktop\\работа\\pdf\\"
     doc_name = "Глоссарий_РЖД.pdf"
-    output_excel = "parsed_glossary_tree.xlsx"
+    output_excel = dir + "parsed_glossary_tree.xlsx"
     doc_path = dir + doc_name
 
-    parse_pdf_to_tree(doc_path, dir+output_excel)
+    # Извлекаем текст из PDF
+    full_text = parse_pdf_to_text(doc_path)
+
+    # Парсим текст и создаем экземпляры Term
+    terms = parse_text(full_text)
+
+    # Создаем DataFrame и сохраняем в Excel
+    df = pd.DataFrame([(term.source, term.target) for term in terms], columns=['Source', 'Target'])
+    df.to_excel(output_excel, index=False)
+
+    # Выводим результаты
+    for term in terms:
+        print(term)

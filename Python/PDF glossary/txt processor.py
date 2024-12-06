@@ -3,7 +3,7 @@ import re
 def build_dictionary(file_path):
     dictionary = {}
     stack = []
-    pattern = re.compile(r'^((?:[А-Яа-яЁё]+ )*[А-Яа-яЁё]+)\s+(.*)$', re.UNICODE)
+    pattern = re.compile(r'^([\t\n\r\f\vЕёА-я~\s_)(-]*)\s+(.*)(?=[A-z]*)$', re.UNICODE)
 
     # Read all lines and handle line continuations
     with open(file_path, 'r', encoding='utf-8') as file:

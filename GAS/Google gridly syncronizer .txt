@@ -1,0 +1,748 @@
+//FilePath: Config.gs
+/**
+ * Function to get configuration data (API key, view ID, spreadsheet ID, and sheet name) from project properties.
+ * @returns {Object} - Configuration data.
+ * @throws {Error} - Error if any required configuration parameter is missing.
+ */
+  function getConfig() {
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const apiKey = scriptProperties.getProperty('apiKey');
+  const spreadsheetId = scriptProperties.getProperty('spreadsheetId');
+  const viewIdStatic = scriptProperties.getProperty('viewIdStatic');
+  const viewIdDynamic = scriptProperties.getProperty('viewIdDynamic');
+  const sheetNameStatic = scriptProperties.getProperty('sheetNameStatic');
+  const sheetNameDynamic = scriptProperties.getProperty('sheetNameDynamic');
+
+
+  if (!apiKey) {
+    throw new Error('API key is not set in script properties.');
+  }
+ 
+  if (!spreadsheetId) {
+    throw new Error('Spreadsheet ID is not set in script properties.');
+  }
+  if (!viewIdStatic){
+    throw new Error('View Id Static is not set in script properties.')
+  }
+
+  if (!viewIdDynamic){
+    throw new Error('View Id Dynamic is not set in script properties.')
+  }
+  
+  if (!sheetNameStatic) {
+    throw new Error('Sheet name static is not set in script properties.');
+  }
+
+  if (!sheetNameDynamic) {
+    throw new Error('Sheet name dynamic is not set in script properties.');
+  }
+
+  return { apiKey, spreadsheetId, viewIdStatic, viewIdDynamic,  sheetNameStatic, sheetNameDynamic };
+}
+
+//Filepath: DataSync.gs
+/**
+ * Class to handle syncronization
+ * @implements {GoogleSheetsDataHandler}, {GridlyDataHandler}
+ */
+class DataSync {
+  constructor(apiKey, spreadsheetId, sheetNameStatic, sheetNameDynamic, viewIdStatic, viewIdDynamic) {
+    this.gridlyHandlerStatic = new GridlyDataHandler(apiKey, viewIdStatic);
+    this.gridlyHandlerDynamic = new GridlyDataHandler(apiKey, viewIdDynamic);
+    this.googleSheetsHandlerStatic = new GoogleSheetsDataHandler(spreadsheetId, sheetNameStatic);
+    this.googleSheetsHandlerDynamic = new GoogleSheetsDataHandler(spreadsheetId, sheetNameDynamic);
+    
+  }
+
+  /**
+   * Export data from Google Sheets to Gridly.
+   * Fetches data from Google Sheets, prepares records, determines actions, executes actions, and creates backups.
+   */
+  async exportDataToGridly() {
+ try {
+      const googleSheetRecordsStatic = await this.googleSheetsHandlerStatic.fetchData();
+      const googleSheetRecordsDynamic = await this.googleSheetsHandlerDynamic.fetchData();
+      const preparedRecordsStatic = this.prepareRecords(googleSheetRecordsStatic);
+      const preparedRecordsDynamic = this.prepareRecords(googleSheetRecordsDynamic);
+      const gridlyRecordsStatic = await this.gridlyHandlerStatic.fetchData();
+      const gridlyRecordsDynamic = await this.gridlyHandlerDynamic.fetchData();
+      const actionsStatic = this.determineActions(preparedRecordsStatic, gridlyRecordsStatic);
+      const actionsDynamic = this.determineActions(preparedRecordsDynamic, gridlyRecordsDynamic);
+      await this.executeActions(actionsStatic, this.gridlyHandlerStatic);
+      await this.executeActions(actionsDynamic, this.gridlyHandlerDynamic);
+      this.createDataBackup(preparedRecordsStatic, 'Static Texts');
+      this.createDataBackup(preparedRecordsDynamic, 'Game Text');
+
+    } catch (error) {
+      Logger.log(`An error occurred: ${error.message}`);
+    }
+  }
+
+  /**
+   * Import data from Gridly to Google Sheets.
+   * Fetches data from Gridly, updates Google Sheets, and creates backups.
+   */
+  async importDataFromGridly() {
+  try {
+    const gridlyRecordsStatic = await this.gridlyHandlerStatic.fetchData();
+    const gridlyRecordsDynamic = await this.gridlyHandlerDynamic.fetchData();
+
+    const preparedRecordsStatic = this.prepareRecords(gridlyRecordsStatic);
+    const preparedRecordsDynamic = this.prepareRecords(gridlyRecordsDynamic);
+
+    Logger.log('Prepared Records Static:');
+    preparedRecordsStatic.forEach(record => Logger.log(record));
+    Logger.log('Prepared Records Dynamic:');
+    preparedRecordsDynamic.forEach(record => Logger.log(record));
+
+    await this.googleSheetsHandlerStatic.updateData(gridlyRecordsStatic);
+    await this.googleSheetsHandlerDynamic.updateData(gridlyRecordsDynamic);
+
+    this.createDataBackup(preparedRecordsStatic, 'Static Texts');
+    this.createDataBackup(preparedRecordsDynamic, 'Game Text');
+  } catch (error) {
+    Logger.log(`An error occurred: ${error.message}`);
+  }
+
+
+  }
+
+   /**
+   * Prepare records for synchronization.
+   * Converts rows of data into records with cells.
+   * @param {Array} data - The data to prepare.
+   * @returns {Array} - The prepared records.
+   */
+  prepareRecords(data) {
+    const headers = data[0];
+    const RECORD_ID_HEADER = 'Record ID';
+    const recordIdIndex = headers.indexOf(RECORD_ID_HEADER);
+
+    if (recordIdIndex === -1) {
+      throw new Error(`Column "${RECORD_ID_HEADER}" not found in the sheet.`);
+    }
+
+    const recordIds = new Set();
+    return data.slice(1).map(row => {
+      const recordId = row[recordIdIndex];
+      if (!recordId) {
+        throw new Error(`Record ID is missing for row: ${row}`);
+      }
+      if (recordIds.has(recordId)) {
+        throw new Error(`Duplicate Record ID found: ${recordId}`);
+      }
+      recordIds.add(recordId);
+
+      const record = { id: recordId, cells: [] };
+      headers.forEach((header, index) => {
+        if (COLUMN_MAPPING[header]) {
+          const columnId = COLUMN_MAPPING[header];
+          const value = row[index];
+          const expectedType = COLUMN_TYPES[columnId];
+          record.cells.push({
+            columnId: columnId,
+            value: DataUtils.convertValue(value, expectedType)
+          });
+        }
+      });
+      return record;
+    });
+  }
+
+  /**
+   * Determine actions for synchronization.
+   * Compares records from Google Sheets and Gridly to determine which records need to be updated or added.
+   * @param {Array} googleSheetRecords - Records from Google Sheets.
+   * @param {Array} gridlyRecords - Records from Gridly.
+   * @returns {Object} - Actions to be taken (update and add).
+   */
+  determineActions(googleSheetRecords, gridlyRecords) {
+    const actions = {
+      update: [],
+      add: []
+    };
+
+    const gridlyRecordMap = gridlyRecords.reduce((map, record) => {
+      map[record.id] = record;
+      return map;
+    }, {});
+
+    googleSheetRecords.forEach(record => {
+      if (gridlyRecordMap[record.id]) {
+        const areEqual = DataUtils.areRecordsEqual(record, gridlyRecordMap[record.id]);
+        if (!areEqual) {
+          actions.update.push(record);
+        }
+      } else {
+        if (!DataUtils.isEmptyRecord(record)) {
+          actions.add.push(record);
+        }
+      }
+    });
+
+    return actions;
+  }
+
+  /**
+   * Execute actions for synchronization.
+   * Adds new records and updates existing records in Gridly.
+   * @param {Object} actions - Actions to be taken (update and add).
+   * @param {GridlyDataHandler} gridlyHandler - The Gridly data handler.
+   */
+  async executeActions(actions, gridlyHandler) {
+    if (actions.add.length > 0) {
+      Logger.log(`Adding ${actions.add.length} records to Gridly`);
+      await gridlyHandler.addRecords(actions.add);
+    }
+    if (actions.update.length > 0) {
+      Logger.log(`Updating ${actions.update.length} records in Gridly`);
+      await gridlyHandler.updateRecords(actions.update);
+    }
+  }
+
+  /**
+   * Create a data backup.
+   * Writes data to a new sheet in the backup spreadsheet.
+   * @param {Array} unifiedData - The data to backup.
+   * @param {string} sheetName - The name of the sheet to create.
+   */
+  createDataBackup(unifiedData, sheetName) {
+  if (!unifiedData || unifiedData.length === 0) {
+    Logger.log('No data to backup.');
+    return;
+  }
+
+  const spreadsheetId = backupDataSpreadsheetId;
+  if (!spreadsheetId) {
+    throw new Error('Backup spreadsheet ID is not defined.');
+  }
+
+  const ss = SpreadsheetApp.openById(spreadsheetId);
+  const now = new Date();
+  const formattedDate = Utilities.formatDate(now, Session.getScriptTimeZone(), 'yyyy-MM-dd_HH-mm-ss');
+  const newSheetName = `${sheetName} ${formattedDate}`;
+  const newSheet = ss.insertSheet(newSheetName);
+  const header = Object.keys(COLUMN_MAPPING);
+
+  const dataToWrite = [header].concat(unifiedData.map(record => {
+    const row = [];
+    header.forEach(header => {
+      if (record.cells) {
+        const cell = record.cells.find(cell => cell.columnId === COLUMN_MAPPING[header]);
+        row.push(cell ? cell.value : '');
+      } else {
+        row.push(''); 
+      }
+    });
+    return row;
+  }));
+
+  Logger.log('Data to Write to Backup:');
+  dataToWrite.forEach(row => Logger.log(row));
+
+  try {
+    newSheet.getRange(1, 1, dataToWrite.length, dataToWrite[0].length).setValues(dataToWrite);
+    Logger.log('Data backup completed successfully.');
+  } catch (error) {
+    Logger.log(`Failed to write backup data: ${error.message}`);
+  }
+}
+
+  /**
+   * String representation of the DataSync object.
+   * @returns {string} - The string representation.
+   */
+  toString() {
+    return `DataSync(spreadsheetId: ${this.googleSheetsHandlerStatic.spreadsheetId}, sheetNameStatic: ${this.googleSheetsHandlerStatic.sheetName}, sheetNameDynamic: ${this.googleSheetsHandlerDynamic.sheetName}, viewIdStatic: ${this.gridlyHandlerStatic.viewId}, viewIdDynamic: ${this.gridlyHandlerDynamic.viewId})`;
+  }
+}
+
+//Filepath: DataUtils.gs
+/**
+ * Class containing utility functions for data processing.
+ */
+class DataUtils {
+
+  /**
+   * Check if a record is empty.
+   * @param {Object} record - The record to check.
+   * @returns {boolean} - True if the record is empty, false otherwise.
+   */
+  static isEmptyRecord(record) {
+    return record.cells.every(({ value }) => value === null || value === '');
+  }
+
+  /**
+   * Convert a value to the expected type.
+   * @param {*} value - The value to convert.
+   * @param {string} expectedType - The expected type (e.g., 'string', 'number').
+   * @returns {*} - The converted value.
+   */
+  static convertValue(value, expectedType) {
+    if (expectedType === 'string') {
+      return value !== null && value !== undefined ? String(value) : '';
+    } else if (expectedType === 'number') {
+      return value !== null && value !== undefined ? Number(value) : 0;
+    }
+    return value;
+  }
+  
+  /**
+   * Compare two records for equality.
+   * @param {Object} record1 - The first record.
+   * @param {Object} record2 - The second record.
+   * @returns {boolean} - True if the records are equal, false otherwise.
+   */
+  static areRecordsEqual(record1, record2) {
+    const cells1 = record1.cells;
+    const cells2 = record2.cells;
+
+    const cells1Map = cells1.reduce((map, cell) => {
+      map[cell.columnId] = cell.value;
+      return map;
+    }, {});
+
+    const cells2Map = cells2.reduce((map, cell) => {
+      map[cell.columnId] = cell.value;
+      return map;
+    }, {});
+
+    for (let columnId in cells1Map) {
+      if (cells1Map[columnId] !== cells2Map[columnId]) {
+        Logger.log(`Value mismatch for column ${columnId}: ${cells1Map[columnId]} vs ${cells2Map[columnId]}`);
+        return false;
+      }
+    }
+
+    for (let columnId in cells2Map) {
+      if (cells2Map[columnId] !== cells1Map[columnId]) {
+        Logger.log(`Value mismatch for column ${columnId}: ${cells2Map[columnId]} vs ${cells1Map[columnId]}`);
+        return false;
+      }
+    }
+
+    Logger.log('Records are identical');
+    return true;
+  }
+}
+
+// File path: GlobalConstants.gs
+/**
+ * Constants and mappings used throughout the project.
+ */
+const GRIDLY_API_URL = 'https://eu-central-1.api.gridly.com/v1/views';
+
+const COLUMN_MAPPING = {
+  'Record ID': 'record_id',
+  'Character': 'character',
+  'Russian': 'russian',
+  'English (United States)': 'english_united_states',
+  'Character limit': 'character_limit',
+  'Version': 'version',
+  'NarrativeComment': 'narrative_comment'
+};
+
+const COLUMN_TYPES = {
+  'record_id': 'string',
+  'character': 'string',
+  'russian': 'string',
+  'english_united_states': 'string',
+  'character_limit': 'number',
+  'version': 'string',
+  'narrative_comment': 'string'
+};
+
+const backupDataSpreadsheetId = '1wD1dR6BsyIXpIoz962--dLrM0kVNd1NkaLpcOIXlkhM';
+
+//FilePath: GoogleSheetsDataHandler
+/**
+ * Class to handle data operations with Google Sheets.
+ */
+class GoogleSheetsDataHandler {
+  /**
+   * Constructor for GoogleSheetsDataHandler.
+   * @param {string} spreadsheetId - The ID of the Google Sheets spreadsheet.
+   * @param {string} sheetName - The name of the sheet within the spreadsheet.
+   */
+  constructor(spreadsheetId, sheetName) {
+    this.spreadsheetId = spreadsheetId;
+    this.sheetName = sheetName;
+  }
+
+  /**
+   * Fetch data from the specified Google Sheets sheet.
+   * @returns {Array} - The data fetched from the sheet.
+   * @throws {Error} - Error if the sheet is not found or data format is incorrect.
+   */
+  fetchData() {
+    const sheet = SpreadsheetApp.openById(this.spreadsheetId).getSheetByName(this.sheetName);
+    if (!sheet) {
+      throw new Error(`Sheet "${this.sheetName}" not found in spreadsheet "${this.spreadsheetId}"`);
+    }
+
+    const range = sheet.getDataRange();
+    const values = range.getValues();
+
+    if (!Array.isArray(values) || !Array.isArray(values[0])) {
+      throw new Error('The data fetched from Google Sheets is not in the correct format.');
+    }
+
+    return values;
+  }
+
+  
+  /**
+   * Update data in the specified Google Sheets sheet.
+   * @param {Array} updates - The data to update.
+   * @throws {Error} - Error if the sheet is not found.
+   */
+  async updateData(updates) {
+    const sheet = SpreadsheetApp.openById(this.spreadsheetId).getSheetByName(this.sheetName);
+    if (!sheet) {
+      throw new Error(`Sheet "${this.sheetName}" not found in spreadsheet "${this.spreadsheetId}"`);
+    }
+
+    // Assuming updates is a 2D array of data to be written to the sheet
+    // ??? should we be able to update only a selected subset of the range
+    const range = sheet.getRange(1, 1, updates.length, updates[0].length);
+    range.setValues(updates);
+
+    Logger.log('Successfully updated records in Google Sheets.');
+  }
+
+  /**
+   * String representation of the GoogleSheetsDataHandler.
+   * @returns {string} - The string representation.
+   */
+  toString() {
+    return `GoogleSheetsDataHandler(spreadsheetId: ${this.spreadsheetId}, sheetName: ${this.sheetName})`;
+  }
+}
+
+//FilePath: GridlyDataHandler.gs 
+/**
+ * Class to handle data operations with Gridly.
+ */
+class GridlyDataHandler {
+  /**
+   * Constructor for GridlyDataHandler.
+   * @param {string} apiKey - The API key for Gridly.
+   * @param {string} viewId - The ID of the view in Gridly.
+   */
+  constructor(apiKey, viewId) {
+    this.apiKey = apiKey;
+    this.viewId = viewId;
+  }
+
+  /**
+   * Fetch data from the specified Gridly view.
+   * @returns {Array} - The data fetched from Gridly.
+   * @throws {Error} - Error if the fetch operation fails.
+   */
+  async fetchData() {
+  const url = `${GRIDLY_API_URL}/${this.viewId}/records`;
+  const options = {
+    method: 'GET',
+    headers: {
+      'Authorization': `ApiKey ${this.apiKey}`,
+      'Accept': 'application/json'
+    }
+  };
+
+  const response = await NetworkHandler.fetchWithRetry(url, options);
+  const responseCode = response.getResponseCode();
+  const responseBody = response.getContentText();
+
+  if (responseCode >= 200 && responseCode < 300) {
+    try {
+      const records = JSON.parse(responseBody);
+      Logger.log('Fetched Records from Gridly:', JSON.stringify(records, null, 2));
+      const preparedRecords = this.prepareGridlyRecords(records);
+      Logger.log('Prepared Records for Backup:', JSON.stringify(preparedRecords, null, 2));
+      return preparedRecords;
+    } catch (e) {
+      throw new Error(`Failed to parse JSON response: ${e.message}`);
+    }
+  } else {
+    throw new Error(`Failed to fetch records from Gridly. Response code: ${responseCode}`);
+  }
+}
+
+  /**
+   * Prepare Gridly records for writing to Google Sheets.
+   * @param {Array} gridlyRecords - The records fetched from Gridly.
+   * @returns {Array} - The prepared records.
+   */
+  prepareGridlyRecords(gridlyRecords) {
+  const headers = Object.keys(COLUMN_MAPPING);
+  const dataToWrite = [headers].concat(gridlyRecords.map(record => {
+    const row = [];
+    headers.forEach(header => {
+      if (record.cells) {
+        const cell = record.cells.find(cell => cell.columnId === COLUMN_MAPPING[header]);
+        row.push(cell ? cell.value : '');
+      } else {
+        row.push(''); 
+      }
+    });
+    return row;
+  }));
+  Logger.log('Prepared Gridly Records for Writing:', JSON.stringify(dataToWrite, null, 2));
+  return dataToWrite;
+}
+
+  /**
+   * Update records in the specified Gridly view.
+   * @param {Array} records - The records to update.
+   * @throws {Error} - Error if the update operation fails.
+   */
+  async updateRecords(records) {
+    const url = `${GRIDLY_API_URL}/${this.viewId}/records`;
+    const options = {
+      method: 'PATCH',
+      headers: {
+        'Authorization': `ApiKey ${this.apiKey}`,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+      },
+      payload: JSON.stringify(records)
+    };
+
+    const response = await UrlFetchApp.fetch(url, options);
+    const responseCode = response.getResponseCode();
+    const responseBody = response.getContentText();
+
+    if (responseCode >= 200 && responseCode < 300) {
+      Logger.log('Records successfully updated in Gridly.');
+    } else {
+      throw new Error(`Failed to update records in Gridly. Response code: ${responseCode}, Response body: ${responseBody}`);
+    }
+  }
+  
+  /**
+   * Add new records to the specified Gridly view.
+   * @param {Array} records - The records to add.
+   * @throws {Error} - Error if the add operation fails.
+   */
+  async addRecords(records) {
+    const url = `${GRIDLY_API_URL}/${this.viewId}/records`;
+    const options = {
+      method: 'POST',
+      headers: {
+        'Authorization': `ApiKey ${this.apiKey}`,
+        'Accept': 'application/json',
+        'Content-Type': 'application/json'
+      },
+      payload: JSON.stringify(records)
+    };
+
+    const response = await UrlFetchApp.fetch(url, options);
+    const responseCode = response.getResponseCode();
+    const responseBody = response.getContentText();
+
+    if (responseCode >= 200 && responseCode < 300) {
+      Logger.log('Records successfully added to Gridly.');
+    } else {
+      throw new Error(`Failed to add records to Gridly. Response code: ${responseCode}, Response body: ${responseBody}`);
+    }
+  }
+
+  /**
+   * String representation of the GridlyDataHandler.
+   * @returns {string} - The string representation.
+   */
+    toString() {
+    return `GridlyDataHandler(viewId: ${this.viewId})`;
+  }
+}
+
+//FilePath: MainScript.gs
+/**
+ * Main script to handle data synchronization between Google Sheets and Gridly.
+ */
+
+/**
+ * Function to upload data from Google Sheets to Gridly.
+ */
+function uploadDataToGridly() {
+  const { apiKey, spreadsheetId, sheetNameStatic, sheetNameDynamic, viewIdStatic, viewIdDynamic } = getConfig();
+  const dataSync = new DataSync(apiKey, spreadsheetId, sheetNameStatic, sheetNameDynamic, viewIdStatic, viewIdDynamic);
+  dataSync.exportDataToGridly();
+}
+
+/**
+ * Function to download data from Gridly to Google Sheets.
+ */
+function downloadDataFromGridly() {
+  const { apiKey, spreadsheetId, sheetNameStatic, sheetNameDynamic, viewIdStatic, viewIdDynamic } = getConfig();
+  const dataSync = new DataSync(apiKey, spreadsheetId, sheetNameStatic, sheetNameDynamic, viewIdStatic, viewIdDynamic);
+  dataSync.importDataFromGridly();
+}
+
+/**
+ * Function to add a custom menu in Google Sheets for easy access to synchronization functions.
+ */
+function onOpen() {
+  let ui = SpreadsheetApp.getUi();
+  ui.createMenu('Gridly')
+    .addItem('Export Data', 'uploadDataToGridly')
+    .addItem('Import Data', 'downloadDataFromGridly')
+    .addToUi();
+}
+
+// Filepath: NetworkHandler.gs
+/**
+ * Class for low-level network operations.
+ */
+class NetworkHandler {
+  
+  /**
+   * Function to perform requests with retries in case of failure.
+   * @async
+   * @param {string} url - The URL for the request.
+   * @param {Object} options - Options for the request.
+   * @param {number} [maxRetries=3] - Maximum number of retry attempts.
+   * @returns {Promise<Object>} - The response from the server.
+   * @throws {Error} - Error if the request fails after all attempts.
+   */
+  static async fetchWithRetry(url, options, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      options.muteHttpExceptions = true; // Disable automatic exception on HTTP error
+      const response = await UrlFetchApp.fetch(url, options);
+      const responseCode = response.getResponseCode();
+
+      switch (responseCode) {
+        case 200: // OK
+        case 201: // Created
+        case 204: // Deleted
+          return response;
+        case 401: // Unauthorized
+          throw new Error('Unauthorized: Check your API key.');
+        case 403: // Forbidden
+          throw new Error('Forbidden: You do not have permission to access this resource.');
+        case 404: // Not Found
+          throw new Error('Not Found: The requested resource was not found.');
+        case 500: // Internal Error
+          throw new Error('Internal Server Error: The server encountered an internal error.');
+        case 504: // Bad Gateway
+          throw new Error('Bad Gateway: The server was acting as a gateway or proxy and received an invalid response.');
+        default:
+          throw new Error(`Unexpected response code: ${responseCode}`);
+      }
+    } catch (e) {
+      if (e.message.startsWith('Unauthorized') || e.message.startsWith('Forbidden')) {
+        // Do not retry for 401 and 403 errors
+        throw e;
+      }
+      if (i === maxRetries - 1) throw e;
+      const backoffTime = Math.pow(2, i) * 1000; // Exponential backoff
+      Utilities.sleep(backoffTime); // Wait before retrying
+    }
+  }
+}
+}
+
+//FilePath Readme.html
+//Таблица https://docs.google.com/spreadsheets/d/16lQqB1ol4iaa9efMXxLyof44Z28jzQT04e2srj15Y7Y/edit?gid=0#gid=0
+//Веб-версия описания https://docs.google.com/document/d/1YdLKG6Khj8lJSapJ_DICXaXGAsoJK8R0kn7PZ8H81FM/edit
+//бекап https://docs.google.com/spreadsheets/d/1wD1dR6BsyIXpIoz962--dLrM0kVNd1NkaLpcOIXlkhM/edit?gid=1247661025#gid=1247661025
+Запуск: запускать из файла MainScript.gs функции uploadDataToGridly или downloadDataFromGridly
+
+
+Описание проекта
+Этот проект представляет собой систему синхронизации данных между Google Sheets и Gridly. Он включает в себя классы для обработки данных, выполнения запросов к API и управления резервными копиями данных.
+
+Структура проекта
+
+Проект состоит из следующих основных компонентов:
+- DataSync.gs - основной класс для синхронизации данных;
+- GridlyDataHandler.gs - класс для обработки данных Gridly;
+- GoogleSheetsDataHandler.gs - класс для обработки данных Google Sheets;
+- DataUtils.gs - вспомогательные функции для обработки данных;
+- Config.gs - функция извлечения данных конфигурации проекта;
+- GlobalConstants.gs - файл для хранения констант и маппингов;
+- MainScript.gs - файл содержит функции для запуска процесса синхронизации данных, также добавляет кнопку управления в интерфейс Google таблички.
+- NetworkHandler.gs
+
+Подробнее о компонентах структуры проекта
+
+- Config.gs
+Функция getConfig извлекает конфигурационные данные (API ключ, ID представления, ID таблиц и  листов) из свойств проекта. Она проверяет наличие всех необходимых параметров и выбрасывает ошибку, если какой-либо из них отсутствует.
+
+- DataSync.gs
+Конструктор инициализирует обработчики данных для статических и динамических листов и представлений.
+exportDataToGridly экспортирует данные из Google Sheets в Gridly, выполняя подготовку записей, определение действий синхронизации и создание резервных копий.
+importDataFromGridly импортирует данные из Gridly в Google Sheets и создает резервные копии данных.
+prepareRecords подготавливает записи для синхронизации, преобразуя строки данных в формат записей с ячейками.
+determineActions определяет действия для синхронизации, сравнивая записи из Google Sheets с записями из Gridly и определяя записи для обновления или добавления.
+executeActions выполняет действия синхронизации, добавляя новые записи в Gridly и обновляя существующие записи.
+createDataBackup создает резервную копию данных, записывая их в новый лист с временной меткой.
+
+
+- DataUtils.gs
+Класс DataUtils содержит вспомогательные функции для обработки данных:
+isEmptyRecord(record) проверяет, является ли запись пустой.
+convertValue(value, expectedType) конвертирует значение в ожидаемый тип.
+areRecordsEqual(record1, record2) сравнивает две записи на равенство.
+
+
+- GlobalConstants.gs
+GRIDLY_API_URL содержит базовый URL для API Gridly.
+COLUMN_MAPPING определяет соответствие между заголовками столбцов в Google Sheets и идентификаторами столбцов в Gridly.
+COLUMN_TYPES задает ожидаемые типы данных для каждого столбца.
+backupDataSpreadsheetId содержит ID таблицы Google Sheets, используемой для резервного копирования данных.
+
+- GoogleSheetsDataHandler.gs
+Конструктор инициализирует обработчик данных с указанным ID таблицы и именем листа.
+fetchData извлекает данные из указанного листа Google Sheets и возвращает их в виде двумерного массива.
+formatData возвращает данные без изменений (предполагается, что данные уже в правильном формате).
+updateData обновляет данные в указанном листе Google Sheets, записывая новые значения в соответствующий диапазон.
+
+
+- GridlyDataHandler.gs
+Конструктор инициализирует обработчик данных с указанным API ключом и ID представления.
+fetchData извлекает данные из указанного представления Gridly, обрабатывает ответ и возвращает подготовленные записи.
+prepareGridlyRecords преобразует записи Gridly в формат, подходящий для записи в Google Sheets.
+updateRecords обновляет записи в указанном представлении Gridly, используя метод PATCH.
+addRecords добавляет новые записи в указанное представление Gridly, используя метод POST.
+
+
+- MainScript.gs
+uploadDataToGridly извлекает конфигурационные данные и инициализирует объект DataSync для экспорта данных из Google Sheets в Gridly.
+downloadDataFromGridly извлекает конфигурационные данные и инициализирует объект DataSync для импорта данных из Gridly в Google Sheets.
+onOpen добавляет пользовательское меню "Gridly" в интерфейс Google Sheets, предоставляя возможность экспорта и импорта данных через вызов функций uploadDataToGridly и downloadDataFromGridly.
+
+
+- NetworkHandler.gs 
+fetchWithRetry выполняет запросы с возможностью повторных попыток в случае сбоя.
+
+
+В целом решение считаю трудозатратным и, из плюсов: можно настроить расписание обновлений данных, собственную логику обработки данных, включить дополнительные операции  в процесс (бекап данных и пр.), добавить кнопки в интерфейс для удобства пользователя.
+
+
+Обзор выполненной работы:
+Исходя из полученной инструкции, изучил документацию, создал проект в Gridly и скопировал таблички с данными  Google Sheet в свой аккаунт и настроил синхронизацию данных.
+
+
+Анализ альтернативных решений:
+1. Решение из коробки
+Здесь (видео с тайм кодом) https://youtu.be/KrWA8vWBiUM?t=1057
+показано решение синхронизации, представляемое Gridly "из коробки" с помощью коннекторов. Инстукция: https://help.gridly.com/import-data/9079547819677-import-data-from-google-sheets
+Оно заключается в следующих этапах:
+- создание подключения в Gridly к гугл таблице (в разделе интеграций проекта);
+- добавление адреса подключения в гугл таблице (в настройках доступа);
+- добавление айди таблицы в Gridly (в настройках подключения);
+
+Плюсы:
+Полагаю, что это наименее трудозатратный способ. 
+Кроме того, управление процессом синхронизации осуществляется из самого Gridly. Т.е. владельцем/менеджером проекта, что, вероятно, более правильно с точки зрения техпроцесса, чем когда управление синхронизацией происходит со стороны таблички Гугл.
+Например, в ситуации, когда внесение изменений в проект Gridly нежелательно.
+Также очевидно, что в решении "из коробки" учтены какие-то ограничения, накладываемые самим Grildy (например, на количество записей в одном представлении), возможно, система контроля версий (branches), используется другой алгоритм синхронизации (приоретизации записей при сравнении)
+
+минусы: Нельзя добавить дополнительную логику обработки данных.
+
+2. Помимо этого есть платные готовце решения https://airbyte.com/how-to-sync/gridly-to-googlesheets
+Из минусов готового решения: дополнительные затраты на лицензирование, необходимость изучения и настройки новой платформы.
+
+

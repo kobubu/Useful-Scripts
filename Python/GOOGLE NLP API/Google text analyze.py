@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # Настройки OAuth 2.0
 SCOPES = ['https://www.googleapis.com/auth/cloud-language']
 CLIENT_SECRETS_FILE = r"C:/дамп базы/client_secret_988095010670-ga9ucce0koo8ddac4g7fc0huggj5fvre.apps.googleusercontent.com.json"  # Укажи свой путь
-EXCEL_FILE = r"C:/Users/Igor/Downloads/Telegram Desktop/IN_1926_UI_Crossword_Master_Проверка_уровней_161_200_FR.xlsx"  # Укажи свой путь
+EXCEL_FILE = r"C:/Users/Igor/Downloads/Telegram Desktop/IN_1926_UI_Crossword_Master_Проверка_уровней_161_200_FR_part3_800-1177.xlsx"  # Укажи свой путь
 OUTPUT_DIR = r"C:/Users/Igor/Downloads/Telegram Desktop/"  # Папка для сохранения
 
 # Генерируем имена файлов с датой и временем
@@ -31,7 +31,7 @@ def get_oauth2_credentials():
 credentials = get_oauth2_credentials()
 access_token = credentials.token
 
-# Функция анализа текста (Sentiment, Classification, Moderation)
+# Функция анализа текста (Sentiment, Classification, Moderation, Entities)
 def analyze_text(text):
     url = "https://language.googleapis.com/v2/documents:annotateText"
     headers = {
@@ -39,11 +39,11 @@ def analyze_text(text):
         "Content-Type": "application/json; charset=utf-8"
     }
     features = {
-        "extractEntities": True,
-        "extractDocumentSentiment": True,
-        "classifyText": True,
-        "extractEntitySentiment": True,
-        "moderateText": True
+        "extractEntities": True,  # Извлекаем сущности
+        "extractDocumentSentiment": True,  # Извлекаем сентимент
+        "classifyText": True,  # Извлекаем классификацию
+        "extractEntitySentiment": True,  # Извлекаем сентимент сущностей
+        "moderateText": True  # Модерация текста
     }
     document = {
         "type": "PLAIN_TEXT",
@@ -61,28 +61,6 @@ def analyze_text(text):
     else:
         return {"error": f"API error: {response.text}"}
 
-# Функция анализа имен собственных
-def analyze_entities(text):
-    url = "https://language.googleapis.com/v2/documents:analyzeEntities"
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json; charset=utf-8"
-    }
-    document = {
-        "type": "PLAIN_TEXT",
-        "content": text,
-        "languageCode": "fr"  # Явно задаем французский язык
-    }
-    body = {
-        "document": document,
-        "encodingType": "UTF8"
-    }
-    response = requests.post(url, headers=headers, data=json.dumps(body))
-    if response.status_code == 200:
-        return response.json()
-    else:
-        return {"error": f"API error: {response.text}"}
-
 # Функция для обработки одной строки
 def process_row(row):
     words = [(row['#Word'], "Word"), (row['#Tips'], "Tips")]
@@ -92,21 +70,20 @@ def process_row(row):
         if pd.isna(word) or word.strip() == "":
             continue  # Пропускаем пустые значения
 
-        # Анализ текста
+        # Анализ текста (Sentiment, Classification, Entities, Moderation)
         result = analyze_text(word)
         if "error" in result:
             print(f"❌ Ошибка обработки '{word}': {result['error']}")
             continue
 
-        # Анализ на имена собственные
-        entity_result = analyze_entities(word)
-
-        # Проверяем, является ли слово именем собственным
-        is_proper_noun = any(entity.get("type") == "PROPER" for entity in entity_result.get("entities", []))
-
         # Извлекаем Sentiment
         sentiment_score = result.get("documentSentiment", {}).get("score", 0)
         sentiment_magnitude = result.get("documentSentiment", {}).get("magnitude", 0)
+
+        # Извлекаем сущности
+        entities = result.get("entities", [])
+        # Проверяем, является ли слово именем собственным
+        is_proper_noun = any(entity.get("type") == "PROPER" for entity in entities)
 
         # Извлекаем категории (Classification)
         categories = [f"{category['name']} ({round(category['confidence'], 3)})"
@@ -122,7 +99,7 @@ def process_row(row):
             "#Level": row["#Level"],
             "Source": source,  # Указывает, откуда слово (Word или Tips)
             "Text": word,
-            "Entities": ", ".join(entity["name"] for entity in result.get("entities", [])),
+            "Entities": ", ".join(entity["name"] for entity in entities),
             "Is Proper Noun": "Yes" if is_proper_noun else "No",
             "Sentiment Score": sentiment_score,
             "Sentiment Magnitude": sentiment_magnitude,
@@ -159,7 +136,11 @@ with ThreadPoolExecutor(max_workers=10) as executor:  # Увеличь max_worke
         results = future.result()
         for row_data in results:
             full_results.append(row_data)
-            if row_data["Sentiment Score"] <= -0.2 or row_data["Moderation"]:
+            # Условия для фильтрации:
+            # 1. Если Sentiment Score <= -0.2
+            # 2. Если есть проблемы с модерацией
+            # 3. Если сущность является именем собственным
+            if row_data["Sentiment Score"] <= -0.2 or row_data["Moderation"] or row_data["Is Proper Noun"] == "Yes":
                 filtered_results.append(row_data)
 
 # Преобразуем в DataFrame

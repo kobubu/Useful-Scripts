@@ -11,6 +11,15 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 import pandas as pd
 import numpy as np
 
+# Установите tensorboard если еще не установлен
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:
+    import subprocess
+    import sys
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "tensorboard"])
+    from torch.utils.tensorboard import SummaryWriter
+
 # Проверка GPU
 print("Проверка устройств...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -79,22 +88,22 @@ model = RobertaForSequenceClassification.from_pretrained(
     num_labels=2
 ).to(device)
 
-# Конфигурация обучения
+# Конфигурация обучения (с исправленным eval_strategy вместо устаревшего evaluation_strategy)
 training_args = TrainingArguments(
     output_dir="./gpu_results",
-    evaluation_strategy="steps",
+    eval_strategy="steps",  # Исправлено здесь
     eval_steps=100,
     logging_steps=50,
     save_steps=200,
     learning_rate=3e-5,
-    per_device_train_batch_size=16,  # Увеличено для GPU
+    per_device_train_batch_size=16,
     per_device_eval_batch_size=32,
     num_train_epochs=5,
     weight_decay=0.01,
     load_best_model_at_end=True,
     metric_for_best_model="f1",
     greater_is_better=True,
-    fp16=True,  # Включено для GPU
+    fp16=True,
     report_to="tensorboard",
     optim="adamw_torch",
     logging_dir="./logs"
@@ -135,3 +144,5 @@ results = trainer.evaluate()
 print("\nФинальные метрики:")
 print(f"Accuracy: {results['eval_accuracy']:.4f}")
 print(f"F1: {results['eval_f1']:.4f}")
+print(f"Precision: {results['eval_precision']:.4f}")
+print(f"Recall: {results['eval_recall']:.4f}")

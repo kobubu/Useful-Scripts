@@ -1,150 +1,137 @@
-from transformers import RobertaTokenizer, RobertaForSequenceClassification, Trainer, TrainingArguments
+import torch
+from transformers import (
+    RobertaTokenizer,
+    RobertaForSequenceClassification,
+    Trainer,
+    TrainingArguments,
+    EarlyStoppingCallback
+)
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
-from sklearn.utils.class_weight import compute_class_weight
-import torch
-import numpy as np
 import pandas as pd
-from transformers import EarlyStoppingCallback
+import numpy as np
 
-# 1. Подготовка данных
-print("Подготовка данных...")
+# Проверка GPU
+print("Проверка устройств...")
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Используемое устройство: {device}")
+if device == "cuda":
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Память GPU: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+
+# Загрузка данных
+print("\nЗагрузка данных...")
+df = pd.read_excel(r'D:\models\модели 2025\localization_report.xlsx')
 df_russian = df[df['language'] == 'russian'].copy()
 df_russian['label'] = df_russian['has_localization_issues'].astype(int)
 
-print("\nРаспределение классов:")
-print(df_russian['label'].value_counts())
+# Балансировка данных
+df_pos = df_russian[df_russian['label'] == 1]
+df_neg = df_russian[df_russian['label'] == 0]
+print(f"Распределение:\nПоложительных: {len(df_pos)}\nОтрицательных: {len(df_neg)}")
 
-# 2. Вычисление весов классов
-class_weights = compute_class_weight(
-    'balanced',
-    classes=np.unique(df_russian['label']),
-    y=df_russian['label']
-)
-class_weights = torch.tensor(class_weights, dtype=torch.float32)
-print(f"\nВеса классов: {class_weights}")
+df_pos_upsampled = pd.concat([df_pos] * 4)
+df_neg_sampled = df_neg.sample(n=min(len(df_neg), len(df_pos)*4), random_state=42)
+df_balanced = pd.concat([df_pos_upsampled, df_neg_sampled]).sample(frac=1, random_state=42)
 
-# 3. Разделение данных
-X_train, X_test, y_train, y_test = train_test_split(
-    df_russian['text'].values,
-    df_russian['label'].values,
-    test_size=0.1,
-    random_state=42,
-    stratify=df_russian['label']
-)
-
-# 4. Инициализация токенизатора
+# Подготовка Dataset
 tokenizer = RobertaTokenizer.from_pretrained("RussianNLP/ruRoBERTa-large-rucola")
 
-# 5. Создание датасета
 class CustomDataset(torch.utils.data.Dataset):
-    def __init__(self, texts, labels, tokenizer, max_length=64):
+    def __init__(self, texts, labels, tokenizer, max_length=128):
         self.texts = texts
         self.labels = labels
         self.tokenizer = tokenizer
         self.max_length = max_length
-        
+
     def __len__(self):
         return len(self.texts)
-    
+
     def __getitem__(self, idx):
-        text = str(self.texts[idx])
-        label = int(self.labels[idx])
-        
         encoding = self.tokenizer(
-            text,
+            str(self.texts[idx]),
             truncation=True,
             max_length=self.max_length,
             padding='max_length',
             return_tensors='pt'
         )
-        
         return {
-            'input_ids': encoding['input_ids'][0],
-            'attention_mask': encoding['attention_mask'][0],
-            'labels': torch.tensor(label, dtype=torch.long)
+            'input_ids': encoding['input_ids'][0].to(device),
+            'attention_mask': encoding['attention_mask'][0].to(device),
+            'labels': torch.tensor(self.labels[idx], dtype=torch.long).to(device)
         }
 
+# Разделение данных
+X_train, X_test, y_train, y_test = train_test_split(
+    df_balanced['text'].astype(str).tolist(),
+    df_balanced['label'].values,
+    test_size=0.1,
+    random_state=42,
+    stratify=df_balanced['label']
+)
+
 train_dataset = CustomDataset(X_train, y_train, tokenizer)
-test_dataset = CustomDataset(X_test, y_test, tokenizer)
+eval_dataset = CustomDataset(X_test, y_test, tokenizer)
 
-# 6. Кастомный Trainer с исправленным методом compute_loss
-class CustomTrainer(Trainer):
-    def __init__(self, class_weights, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.class_weights = class_weights
-        self.loss_fct = torch.nn.CrossEntropyLoss(weight=self.class_weights)
-    
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):  # Исправлено
-        labels = inputs.get("labels")
-        outputs = model(**inputs)
-        loss = self.loss_fct(outputs.logits.view(-1, model.config.num_labels), 
-                            labels.view(-1))
-        return (loss, outputs) if return_outputs else loss
-
-# 7. Загрузка модели
+# Инициализация модели на GPU
 model = RobertaForSequenceClassification.from_pretrained(
     "RussianNLP/ruRoBERTa-large-rucola",
     num_labels=2
-)
+).to(device)
 
-# 8. Параметры обучения (актуальные)
+# Конфигурация обучения
 training_args = TrainingArguments(
-    output_dir="./results",
+    output_dir="./gpu_results",
+    evaluation_strategy="steps",
+    eval_steps=100,
+    logging_steps=50,
+    save_steps=200,
+    learning_rate=3e-5,
+    per_device_train_batch_size=16,  # Увеличено для GPU
+    per_device_eval_batch_size=32,
     num_train_epochs=5,
-    per_device_train_batch_size=4,
-    per_device_eval_batch_size=8,
-    eval_strategy="epoch",  # Исправлено на актуальное имя параметра
-    save_strategy="epoch",
-    logging_dir='./logs',
-    logging_steps=10,
-    learning_rate=2e-5,
     weight_decay=0.01,
     load_best_model_at_end=True,
     metric_for_best_model="f1",
     greater_is_better=True,
-    report_to="none",
-    use_cpu=True,  # Явное использование CPU
-    fp16=False,
-    bf16=False
+    fp16=True,  # Включено для GPU
+    report_to="tensorboard",
+    optim="adamw_torch",
+    logging_dir="./logs"
 )
 
-# 9. Функция вычисления метрик
 def compute_metrics(pred):
-    labels = pred.label_ids
-    preds = pred.predictions.argmax(-1)
-    
+    labels = pred.label_ids.cpu()
+    preds = pred.predictions.argmax(-1).cpu()
     precision, recall, f1, _ = precision_recall_fscore_support(
         labels, preds, average='binary', zero_division=0
     )
-    acc = accuracy_score(labels, preds)
     return {
-        'accuracy': acc,
+        'accuracy': accuracy_score(labels, preds),
         'f1': f1,
         'precision': precision,
-        'recall': recall,
-        'positive_rate': np.mean(preds)
+        'recall': recall
     }
 
-# 10. Обучение модели
-trainer = CustomTrainer(
-    class_weights=class_weights.to('cpu'),  # Веса на CPU
+# Обучение
+trainer = Trainer(
     model=model,
     args=training_args,
     train_dataset=train_dataset,
-    eval_dataset=test_dataset,
+    eval_dataset=eval_dataset,
     compute_metrics=compute_metrics,
     callbacks=[EarlyStoppingCallback(early_stopping_patience=2)]
 )
 
-print("\nНачало обучения...")
+print("\nСтарт обучения на GPU...")
 trainer.train()
 
-# Сохранение результатов
-model.save_pretrained("./localization_model")
-tokenizer.save_pretrained("./localization_model")
+# Сохранение модели
+model.save_pretrained("./best_gpu_model")
+tokenizer.save_pretrained("./best_gpu_model")
 
-# Оценка модели
+# Оценка
 results = trainer.evaluate()
 print("\nФинальные метрики:")
-print(results)
+print(f"Accuracy: {results['eval_accuracy']:.4f}")
+print(f"F1: {results['eval_f1']:.4f}")

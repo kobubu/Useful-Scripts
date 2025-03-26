@@ -11,15 +11,6 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 import pandas as pd
 import numpy as np
 
-# Установите tensorboard если еще не установлен
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except ImportError:
-    import subprocess
-    import sys
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "tensorboard"])
-    from torch.utils.tensorboard import SummaryWriter
-
 # Проверка GPU
 print("Проверка устройств...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -65,9 +56,9 @@ class CustomDataset(torch.utils.data.Dataset):
             return_tensors='pt'
         )
         return {
-            'input_ids': encoding['input_ids'][0].to(device),
-            'attention_mask': encoding['attention_mask'][0].to(device),
-            'labels': torch.tensor(self.labels[idx], dtype=torch.long).to(device)
+            'input_ids': encoding['input_ids'][0],
+            'attention_mask': encoding['attention_mask'][0],
+            'labels': torch.tensor(self.labels[idx], dtype=torch.long)
         }
 
 # Разделение данных
@@ -82,22 +73,22 @@ X_train, X_test, y_train, y_test = train_test_split(
 train_dataset = CustomDataset(X_train, y_train, tokenizer)
 eval_dataset = CustomDataset(X_test, y_test, tokenizer)
 
-# Инициализация модели на GPU
+# Инициализация модели
 model = RobertaForSequenceClassification.from_pretrained(
     "RussianNLP/ruRoBERTa-large-rucola",
     num_labels=2
 ).to(device)
 
-# Конфигурация обучения (с исправленным eval_strategy вместо устаревшего evaluation_strategy)
+# Конфигурация обучения
 training_args = TrainingArguments(
     output_dir="./gpu_results",
-    eval_strategy="steps",  # Исправлено здесь
+    eval_strategy="steps",
     eval_steps=100,
     logging_steps=50,
     save_steps=200,
     learning_rate=3e-5,
-    per_device_train_batch_size=16,
-    per_device_eval_batch_size=32,
+    per_device_train_batch_size=8,  # Уменьшено для 4GB GPU
+    per_device_eval_batch_size=16,
     num_train_epochs=5,
     weight_decay=0.01,
     load_best_model_at_end=True,
@@ -106,12 +97,13 @@ training_args = TrainingArguments(
     fp16=True,
     report_to="tensorboard",
     optim="adamw_torch",
-    logging_dir="./logs"
+    logging_dir="./logs",
+    dataloader_pin_memory=False  # Отключено для избежания ошибки
 )
 
 def compute_metrics(pred):
-    labels = pred.label_ids.cpu()
-    preds = pred.predictions.argmax(-1).cpu()
+    labels = pred.label_ids
+    preds = pred.predictions.argmax(-1)
     precision, recall, f1, _ = precision_recall_fscore_support(
         labels, preds, average='binary', zero_division=0
     )
